@@ -1,0 +1,9 @@
+# Необязательно: "Blueprint" для Render. Можно создать сервис и вручную - см. README.md.
+services:
+  - type: web
+    name: media-overlay-sync
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /health
