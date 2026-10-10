@@ -19,6 +19,7 @@
   GET  /ping               - для замера задержки
   GET  /health             - для проверок хостинга
 """
+import hashlib
 import json
 import os
 import re
@@ -34,6 +35,7 @@ HOST_TAKEOVER = 15.0       # чужой хост может занять ком�
 VIEWER_ALIVE = 15.0        # зритель считается "в комнате", если опрашивал не позже этого
 ROOM_TTL = 1800.0          # комната без активности удаляется через 30 минут
 MAX_BODY = 4096            # байт в теле запроса хоста
+MAX_COVER = 40000          # байт в обложке (хост присылает уменьшенный jpeg, обычно 5-15 КБ)
 MAX_WAIT = 20.0            # дольше этого долгий опрос не держим
 SEEK_TOLERANCE = 0.8       # на столько секунд позиция может разойтись с ожидаемой, не считаясь перемоткой
 
@@ -53,6 +55,8 @@ class Room:
         self.ver = 0               # растёт при каждом "событии": смена трека, пауза, перемотка, уход хоста
         self.last_host = 0.0
         self.bye = False
+        self.cover = b""           # уменьшенная обложка текущего трека (jpeg/png)
+        self.cover_id = ""         # короткий хеш обложки; зрители качают её, когда он меняется
         self.viewers = {}          # id зрителя -> когда последний раз опрашивал
         self.touched = time.monotonic()
 
@@ -101,6 +105,7 @@ def host_update(name, token, body):
                 return 403, {"ok": False, "error": "room_busy"}
             room.token = token                              # прежний хост пропал - комнату занимает новый
             room.state = None
+            room.cover, room.cover_id = b"", ""
 
         st = _clean_state(body)
         try:
@@ -115,6 +120,8 @@ def host_update(name, token, body):
         if not changed:
             if any(prev[k] != st[k] for k in ("artist", "title", "album", "duration", "playing")):
                 changed = True
+                if any(prev[k] != st[k] for k in ("artist", "title", "album")):
+                    room.cover, room.cover_id = b"", ""      # новый трек - старая обложка не годится
             else:
                 expected = prev["pos"] + ((now - room.t_srv) if prev["playing"] else 0.0)
                 changed = abs(expected - st["pos"]) > SEEK_TOLERANCE
@@ -123,7 +130,25 @@ def host_update(name, token, body):
         if changed:
             room.ver += 1
             COND.notify_all()
-        return 200, {"ok": True, "ver": room.ver, "viewers": room.viewer_count(now)}
+        return 200, {"ok": True, "ver": room.ver, "viewers": room.viewer_count(now), "cid": room.cover_id}
+
+
+def host_cover(name, token, data):
+    """Хост присылает обложку текущего трека. Зрителей будим: у них появится новый cid."""
+    if len(data) < 16 or not (data[:2] == b"\xff\xd8" or data[:4] == b"\x89PNG"):
+        return 400, {"ok": False, "error": "bad_cover"}
+    now = time.monotonic()
+    with COND:
+        room = ROOMS.get(name)
+        if room is None or room.token != token:
+            return 403, {"ok": False, "error": "not_host"}
+        cid = hashlib.sha1(data).hexdigest()[:10]
+        if cid != room.cover_id:
+            room.cover, room.cover_id = bytes(data), cid
+            room.ver += 1
+            COND.notify_all()
+        room.touched = now
+        return 200, {"ok": True, "cid": cid}
 
 
 def host_bye(name, token):
@@ -133,6 +158,7 @@ def host_bye(name, token):
         if room is None or room.token != token:
             return 200, {"ok": True}
         room.bye = True
+        room.cover, room.cover_id = b"", ""
         room.ver += 1
         COND.notify_all()
         return 200, {"ok": True}
@@ -155,6 +181,7 @@ def viewer_state(name, vid, since, wait):
                 alive = room is not None and room.host_alive(now)
                 return 200, {"ok": True, "exists": room is not None, "host": alive, "ver": ver,
                              "viewers": room.viewer_count(now) if room else 0,
+                             "cid": room.cover_id if alive else "",
                              "age": (now - room.t_srv) if alive else 0.0,
                              "state": room.state if alive else None}
             COND.wait(deadline - now)
@@ -209,6 +236,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"ok": False, "error": "bad_params"})
             code, payload = viewer_state(name, vid, since, wait)
             return self._send(code, payload)
+        if len(parts) == 3 and parts[0] == "r" and parts[2] == "cover":
+            with COND:
+                room = ROOMS.get(parts[1].lower())
+                data = room.cover if room is not None and room.host_alive(time.monotonic()) else b""
+            if not data:
+                return self._send(404, {"ok": False, "error": "no_cover"})
+            return self._send(200, data, "image/png" if data[:4] == b"\x89PNG" else "image/jpeg")
         self._send(404, {"ok": False, "error": "not_found"})
 
     def do_POST(self):
@@ -217,11 +251,12 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             length = -1
-        if length < 0 or length > MAX_BODY:
+        is_cover = len(parts) == 3 and parts[0] == "r" and parts[2] == "cover"
+        if length < 0 or length > (MAX_COVER if is_cover else MAX_BODY):
             self.close_connection = True
             return self._send(413, {"ok": False, "error": "too_large"})
         raw = self.rfile.read(length) if length else b""          # тело всегда вычитываем до конца (keep-alive)
-        if len(parts) == 3 and parts[0] == "r" and parts[2] in ("host", "bye"):
+        if len(parts) == 3 and parts[0] == "r" and parts[2] in ("host", "bye", "cover"):
             name = parts[1].lower()
             token = self.headers.get("X-Token", "")
             if not ROOM_RE.match(name):
@@ -230,6 +265,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"ok": False, "error": "bad_token"})
             if parts[2] == "bye":
                 return self._send(*host_bye(name, token))
+            if parts[2] == "cover":
+                return self._send(*host_cover(name, token, raw))
             try:
                 body = json.loads(raw.decode("utf-8") or "{}")
                 if not isinstance(body, dict):
